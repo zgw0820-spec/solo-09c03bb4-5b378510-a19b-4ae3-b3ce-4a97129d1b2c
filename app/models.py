@@ -85,7 +85,10 @@ class NotificationView(BaseModel):
     contact: Contact
     state: str = Field(description="pending | in_flight | unknown | accepted | failed | cancelled")
     display_status: str = Field(
-        description="Operator-facing state: queued | sending | receipt_unconfirmed | accepted | rejected | cancelled_before_dispatch"
+        description=(
+            "Operator-facing state: queued | sending | receipt_unconfirmed（待核实：受理结果不明，"
+            "只按通知号查询、不得重发）| accepted | rejected | cancelled_before_dispatch"
+        )
     )
     display_text: str = Field(description="Human-readable Chinese status label")
     gateway_status: str | None = None

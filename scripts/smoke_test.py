@@ -10,6 +10,10 @@ It exercises the paths that are hard to see in unit tests:
   2. submit -> escalate exactly once
   3. slow gateway: unknown receipt must not escalate; recovery must not double-page
   4. dropped receipt: gateway accepted, API must resolve via lookup, not re-post
+  5. idempotent submission and per-number lookup
+  6. confirmation handoff: an in-flight/unknown backup becomes lookup-only after
+     confirmation — never re-sent while the gateway has no record, and a late
+     acceptance is reported with the gateway's real acceptance time.
 
 Exits non-zero on the first violated assertion. Run it with -I.
 """
@@ -139,6 +143,73 @@ def main() -> int:
     notification_no = view["notifications"][0]["notification_no"]
     status, single = call("GET", f"{API}/notifications/{notification_no}")
     check(status == 200 and single["notification_no"] == notification_no, "lookup by notification number")
+
+    print("[6] confirmation handoff: unknown backup is lookup-only, never re-sent")
+    alarm_no = f"{RUN}-HANDOFF"
+    # Drop the backup's receipt: the gateway accepts durably but the API never
+    # gets the acknowledgment, leaving the backup receipt unknown.
+    put_config(slow_ms=0, drop_receipt=True, drop_hold_ms=2500, reject=False)
+    call("POST", f"{API}/alarms", payload(alarm_no, 2))
+    wait_for(
+        alarm_no,
+        lambda v: any(
+            n["role"] == "backup" and n["state"] in {"unknown", "in_flight"}
+            for n in v["notifications"]
+        ),
+    )
+    _, view = call("GET", f"{API}/alarms/{alarm_no}")
+    backup_no = next(n for n in view["notifications"] if n["role"] == "backup")["notification_no"]
+
+    # Confirm while the backup outcome is unknown.
+    status, view = call("POST", f"{API}/alarms/{alarm_no}/confirm", {"confirmed_by": "张工"})
+    check(status == 200 and view["confirmed"] is True, "alarm confirmed with unknown backup")
+    confirmed_at = view["confirmed_at"]
+
+    # Remove the gateway record to simulate "the POST never reached it": every
+    # subsequent lookup now answers 404. The API must keep verifying and must
+    # NOT re-post behind a confirmation.
+    status, _ = call("DELETE", f"{GATEWAY}/notifications/{backup_no}")
+    check(status == 200, "gateway backup record removed to simulate a missing POST")
+    put_config(slow_ms=0, drop_receipt=False, reject=False)
+    time.sleep(3.0)  # well past the not-found-miss re-post threshold
+    _, view = call("GET", f"{API}/alarms/{alarm_no}")
+    backup = next(n for n in view["notifications"] if n["role"] == "backup")
+    check(backup["state"] == "unknown", "no-record backup stays 待核实 (unknown), not cancelled/delivered")
+    check("待核实" in backup["display_text"], "ambiguous backup is labelled 待核实")
+    check(backup["attempts"] == 1, "no re-POST after confirmation (attempts stays 1)")
+    remaining = call("GET", f"{GATEWAY}/notifications?alarm_no={alarm_no}")[1].get("items", [])
+    check(
+        all(r["notification_no"] != backup_no for r in remaining),
+        "gateway still has no backup record (nothing was re-sent)",
+    )
+
+    # The gateway's late acceptance now appears (e.g. a delayed durable record).
+    # Re-create it directly at the gateway with the same notification number;
+    # the API must discover it purely via GET lookup and report the gateway's
+    # real acceptance time, with zero new API-side POSTs.
+    time.sleep(1.1)
+    status, _ = call(
+        "POST",
+        f"{GATEWAY}/notifications",
+        {
+            "notification_no": backup_no,
+            "alarm_no": alarm_no,
+            "role": "backup",
+            "contact": {"name": "备班 李工", "channel": "sms"},
+            "payload": {},
+        },
+    )
+    check(status == 202, "late acceptance recorded at the gateway")
+    _, gw_record = call("GET", f"{GATEWAY}/notifications/{backup_no}")
+    view = wait_for(
+        alarm_no,
+        lambda v: next(n for n in v["notifications"] if n["role"] == "backup")["state"] == "accepted",
+    )
+    backup = next(n for n in view["notifications"] if n["role"] == "backup")
+    check(backup["accepted_at"] == gw_record["accepted_at"], "real gateway acceptance time is shown")
+    check(backup["accepted_at"] > confirmed_at, "acceptance happened after confirmation")
+    check(backup["delivered_after_confirmation"] is True, "post-confirmation delivery flagged")
+    check(backup["attempts"] == 1, "acceptance resolved purely by lookup, no re-POST")
 
     print("smoke test passed")
     return 0

@@ -160,6 +160,18 @@ def reset() -> dict[str, Any]:
     return {"status": "reset"}
 
 
+@app.delete("/notifications/{notification_no}")
+def delete_notification(notification_no: str) -> dict[str, Any]:
+    """Remove one record so lookups return 404 again. Test convenience used to
+    simulate a POST that never reached the gateway."""
+    s = state()
+    removed = s.records.pop(notification_no, None)
+    if removed is None:
+        raise HTTPException(status_code=404, detail="unknown notification")
+    s._save()
+    return {"status": "deleted", "notification_no": notification_no}
+
+
 @app.post("/notifications", status_code=status.HTTP_202_ACCEPTED)
 async def accept_notification(payload: NotificationIn, response: Response) -> dict[str, Any]:
     s = state()

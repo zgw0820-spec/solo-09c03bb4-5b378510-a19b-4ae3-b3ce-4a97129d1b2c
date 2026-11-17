@@ -82,11 +82,33 @@ pending ──POST──> in_flight ──网关 202 accepted──> accepted   
 | 到期已生成备班行、但尚未发送 | 确认与“取消备班行”在同一事务完成，`status=confirmed`，备班显示“未投递即取消” |
 | 备班已在途 | 确认成功，但**不撤回、也不再新建**；最终通过网关查询得到真实受理结果，显示 `confirmed_after_escalation`，并标记 `delivered_after_confirmation=true` 与“在途无法撤回”告警 |
 
+### 4.1 确认与备班回执核查的交接（事故修复）
+
+事故场景：备班投递已占用一次发送资格，进程在请求到达网关前中断；重启后连续查无记录，
+又在告警确认之后重发了这条备班。修复后的硬性规则：
+
+- **确认前仍排队（`pending`，从未发送）的备班**：照旧在确认事务内取消（`cancelled`），
+  永不进入网关；即使 worker 已先抢占该行，也会跳过 POST 并放回待取消。
+- **确认时已在途（`in_flight`）或回执不明（`unknown`）的备班**：此后**只按原通知号
+  GET 查询**受理结果，任何路径都不得新发或重发——包括“连续查无记录 N 次后重投”的逻辑
+  和重启恢复路径。
+- **如实披露，不冒称结论**：网关暂查无记录（`not_found`）或查询故障期间，备班一律显示
+  `待核实`（`display_status=receipt_unconfirmed`），绝不会显示为“已取消”或“已送达”。
+- **网关迟到受理**：补查一旦查到受理，采用**网关记录的真实受理时间**（`accepted_at`）；
+  若该时间晚于确认时间，标记 `delivered_after_confirmation=true` 并提示“在途无法撤回”。
+- **重启后继续遵守**：启动恢复只把中断的在途行转为待查，确认标记在数据库中，重发守卫
+  对新进程同样生效。
+- **未确认告警不受影响**：主通知的正常重试、查无记录后的重投逻辑保持原样。
+
+实现上，worker 的所有 POST 入口（后台派发、单步 `dispatch_once`、查无记录后的重投）都经过
+同一个 `_posting_allowed` 守卫：备班通知所属告警一旦 `confirmed_at` 非空即禁止 POST。
+
 ### 5. 重启接续
 
 - 重启时 `in_flight` 行（上一进程死在 POST 中）转为 `unknown`，先查网关再决定是否重投。
 - 若网关已受理，直接采纳受理结果，**不会重发**；若网关无记录，重投时通知号相同，
   网关去重保证最多一次投递。
+- 已确认告警的备班通知例外：即使网关持续查无记录也**只查不发**（见 4.1），重启后同样生效。
 - pending/未知回执、未确认告警的到期扫描都从数据库重建，无内存队列可丢。
 
 ### 6. 慢投递不影响其他告警
@@ -117,6 +139,7 @@ pending ──POST──> in_flight ──网关 202 accepted──> accepted   
 |---|---|---|
 | POST | `/notifications` | 受理通知，按 `notification_no` 去重；重复请求返回 `{"status":"duplicate"}` |
 | GET | `/notifications/{no}` | 查询受理结果（回执丢失后的权威来源） |
+| DELETE | `/notifications/{no}` | 删除单条记录使查询重新 404（测试便利，模拟请求未到达网关） |
 | GET | `/notifications` | 列出所有通知记录（`?role=&alarm_no=`） |
 | GET/PUT | `/config` | 运行时调整故障注入 |
 | DELETE | `/admin/reset` | 清空记录（测试便利） |
@@ -179,14 +202,15 @@ curl -s localhost:8000/alarms/DEMO-2 | python3 -m json.tool
 ## 测试
 
 ```bash
-python -m pytest -q                     # 27 个测试，进程内假网关，真实 SQLite 文件
+python -m pytest -q                     # 32 个测试，进程内假网关，真实 SQLite 文件
 API_URL=http://localhost:8000 GATEWAY_URL=http://localhost:9000 \
   python -I scripts/smoke_test.py       # 对真实运行的服务做端到端冒烟
 ```
 
 覆盖：幂等提交与 409、计时起点、确认阻断升级、逾期仅一次、回执不明不升级、
 回执补查不重复投递、重启接续（三种中断点）、确认 vs 到期竞态、慢投递不阻塞、
-拒收处理、在途备班如实披露、Swagger/OpenAPI。
+拒收处理、在途备班如实披露、**确认后备班只查不发（查无记录/查询故障/重启均不重发）、
+迟到受理显示网关真实受理时间与确认后投递标记**、Swagger/OpenAPI。
 
 ## 已知限制
 

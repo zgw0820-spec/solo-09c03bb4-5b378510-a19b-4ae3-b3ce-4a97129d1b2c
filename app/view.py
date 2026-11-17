@@ -16,8 +16,8 @@ from typing import Any
 
 NOTIFICATION_DISPLAY = {
     "pending": ("queued", "待发送"),
-    "in_flight": ("sending", "发送中"),
-    "unknown": ("receipt_unconfirmed", "回执未确认"),
+    "in_flight": ("sending", "发送中（受理结果待核实）"),
+    "unknown": ("receipt_unconfirmed", "待核实"),
     "accepted": ("accepted", "网关已受理"),
     "failed": ("rejected", "网关拒收"),
     "cancelled": ("cancelled_before_dispatch", "未投递即取消"),
@@ -59,6 +59,13 @@ def _notification_view(row: dict[str, Any], confirmed_at: str | None) -> dict[st
         display_text = "未投递即取消（确认早于发送）"
     elif delivered_after_confirmation:
         display_text = "确认后才被网关受理（在途，无法撤回）"
+    elif state == "unknown" and row.get("gateway_status") == "not_found":
+        # Truthful ambiguity: the gateway currently has no record. This must
+        # never be phrased as "cancelled" or "delivered" — the outcome is
+        # genuinely unknown until a later lookup resolves it.
+        display_text = "待核实（网关暂查无记录，继续按原通知号核查）"
+    elif state == "unknown":
+        display_text = "待核实（查询故障或回执不明，暂不能认定送达或取消）"
 
     return {
         "notification_no": row["notification_no"],
@@ -124,7 +131,13 @@ def build_alarm_view(
     if primary is not None and primary["state"] == "failed":
         warnings.append("网关明确拒收主通知，系统不会自动重发，请人工核实主备联系人。")
     if backup is not None and backup["state"] in {"in_flight", "unknown"}:
-        warnings.append("备班通知已提交且在途，受理结果正在向网关查明，请以查询结果为准。")
+        if confirmed:
+            warnings.append(
+                "确认时该备班通知已在途或回执不明：系统只按原通知号向网关查明受理结果，"
+                "不会新发或重发；暂查无记录或查询故障期间一律显示“待核实”。"
+            )
+        else:
+            warnings.append("备班通知已提交且在途，受理结果正在向网关查明，请以查询结果为准。")
     if (
         backup is not None
         and confirmed

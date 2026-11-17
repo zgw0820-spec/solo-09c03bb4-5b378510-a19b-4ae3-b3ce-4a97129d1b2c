@@ -341,6 +341,52 @@ class AlarmService:
             )
             return True
 
+    def cancel_undispatched_backup(self, notification_id: int) -> bool:
+        """Cancel a backup that lost the race with confirmation.
+
+        Reached only when the dispatcher claimed a still-``pending`` row (the
+        claim moved it to ``in_flight``) and then found the alarm already
+        confirmed. Such a row has never been handed to the gateway — a row that
+        died mid-POST is recovered as ``unknown`` — so cancelling it means no
+        page ever went out, matching the cancellation confirm() performs for
+        rows it can still see as pending.
+        """
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM notifications WHERE id = ?", (notification_id,)
+            ).fetchone()
+            if row is None or row["role"] != "backup" or row["state"] != "in_flight":
+                return False
+            alarm = conn.execute(
+                "SELECT confirmed_at FROM alarms WHERE alarm_no = ?", (row["alarm_no"],)
+            ).fetchone()
+            if alarm is None or alarm["confirmed_at"] is None:
+                return False
+            conn.execute(
+                """
+                UPDATE notifications
+                   SET state = 'cancelled',
+                       detail = 'cancelled before dispatch: alarm confirmed after escalation',
+                       history_json = ?, next_attempt_at = NULL, lease_until = NULL
+                 WHERE id = ? AND state = 'in_flight'
+                """,
+                (
+                    self._append_history(
+                        row["history_json"],
+                        "cancelled",
+                        "alarm confirmed after escalation, before dispatch",
+                    ),
+                    notification_id,
+                ),
+            )
+            self._event(
+                conn,
+                row["alarm_no"],
+                "backup_cancelled",
+                f"{row['notification_no']} cancelled by dispatcher: confirmation won the race",
+            )
+            return True
+
     # ------------------------------------------------------------ notification
 
     def notifications_needing_action(self, now_real: float) -> list[dict[str, Any]]:

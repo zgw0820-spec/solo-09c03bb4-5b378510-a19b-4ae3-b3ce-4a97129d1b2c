@@ -158,12 +158,47 @@ class Dispatcher:
         try:
             if row["state"] in {"unknown", "in_flight"}:
                 await self._resolve_ambiguous(row)
-            else:
+            elif self._posting_allowed(row):
                 await self._post(row)
+            else:
+                # The alarm was confirmed after this backup was queued. The row
+                # is only claimed (in_flight), never handed to the gateway, so
+                # cancel it exactly as confirm() does for still-pending rows.
+                if self.service.cancel_undispatched_backup(row["id"]):
+                    log.info(
+                        "backup %s cancelled: alarm %s confirmed before dispatch",
+                        row["notification_no"],
+                        row["alarm_no"],
+                    )
+                else:
+                    # Lost an internal race; re-check on the next tick.
+                    self.service.mark_notification(
+                        row["id"],
+                        "pending",
+                        row.get("gateway_status"),
+                        "dispatch skipped: alarm confirmed before dispatch",
+                    )
         except asyncio.CancelledError:
             raise
         except Exception:
             log.exception("delivery of %s failed", row["notification_no"])
+
+    def _posting_allowed(self, row: dict[str, Any]) -> bool:
+        """Whether a gateway POST is permitted for this notification.
+
+        Handoff rule between confirmation and backup receipt reconciliation:
+        once the alarm is confirmed, a backup notification may only be checked
+        by its original notification number (GET lookup) — never newly sent or
+        re-sent, even if the gateway currently has no record. Primary
+        notifications are unaffected, so the normal retry path for an
+        unconfirmed alarm keeps working.
+        """
+        if row.get("role") != "backup":
+            return True
+        alarm = self.db.query_one(
+            "SELECT confirmed_at FROM alarms WHERE alarm_no = ?", (row["alarm_no"],)
+        )
+        return alarm is None or alarm["confirmed_at"] is None
 
     async def _deadline_loop(self) -> None:
         while not self._stop.is_set():
@@ -233,7 +268,15 @@ class Dispatcher:
             return False  # another worker got it
 
         if row["state"] == "pending":
-            await self._post(row)
+            if self._posting_allowed(row):
+                await self._post(row)
+            elif not self.service.cancel_undispatched_backup(row["id"]):
+                self.service.mark_notification(
+                    row["id"],
+                    "pending",
+                    row.get("gateway_status"),
+                    "dispatch skipped: alarm confirmed before dispatch",
+                )
         else:
             await self._resolve_ambiguous(row)
         return True
@@ -260,6 +303,11 @@ class Dispatcher:
         will win the insert. Anything else stays unknown and is retried on the
         next tick; critically, no timer is started and no escalation is
         triggered while the receipt is unknown.
+
+        Handoff exception: once the alarm has been confirmed, a backup
+        notification is lookup-only forever. Repeated "not found" answers (or a
+        lookup outage) keep it shown as 待核实 (verification pending); the
+        notification must never be re-sent behind a confirmation.
         """
         self.lookup_attempts += 1
         result = await self.gateway.lookup(row["notification_no"])
@@ -269,6 +317,22 @@ class Dispatcher:
             # backoff between lookups. The notification number is the gateway's
             # dedupe key, so even a re-post racing the original yields exactly
             # one delivery.
+            if not self._posting_allowed(row):
+                log.info(
+                    "backup %s absent from gateway but alarm is confirmed; "
+                    "staying lookup-only, no re-post",
+                    row["notification_no"],
+                )
+                self.service.mark_notification(
+                    row["id"],
+                    "unknown",
+                    "not_found",
+                    "gateway has no record yet; alarm already confirmed, so the backup "
+                    "is verified by lookup only and will not be re-sent",
+                    retry_at=time.time() + self.max_backoff_seconds,
+                    lookup_miss=True,
+                )
+                return
             misses = int(row.get("lookup_misses") or 0) + 1
             if misses >= self.not_found_misses_before_repost:
                 log.info(
